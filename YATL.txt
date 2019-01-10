@@ -1,0 +1,654 @@
+Yet Another TODO List for QE - Epiphany version - PG, 2019
+
+1.  General Organization of QE (including cleanup and modularization)
+
+1.1 Cleanup of "control_flags" module
+
+    Description of the problem:
+    Even after some cleanup, the "control_flag" module is still a hodgepodge
+    of miscellaneous variables in which it is hard to find a logic. While most
+    of them are control variables (i.e. variables that control the flux of the
+    code), there are also other parameters and thresholds; variables that are
+    initialized and never change, other that change all the time during the
+    run; variables used everywhere along with variables used only in a single
+    code or in a single special case. Not all control variables are in
+    "control_flags", though: many others are distributed in other modules.
+
+    Actions:
+    - Remove obsolete variables; displace obviously misplaced ones (for
+      instance those used in very specific places or in specific codes);
+      elaborate a strategy about the remaining ones. Possibilities:
+      * Collect all variables affecting the flux of the code (and only those)
+        into control_flags. Advantage: straightforward, minimizes dependencies
+        of main routines. Disavantage: control_flags will still contain a bunch
+        of variables not having much in common beyond being control variables.
+      * Distribute them into modules to which they belong. Advantage: more
+        "modular" solution. Disavantage: may add a large number of dependencies
+        upon modules under the form of USE this, ONLY: that.
+    
+1.2 Reorganization of relax, md, vc-relax and vc-md in PWscf.
+
+    Description of the problem:
+    Electronic-structure calculations typically consist of an external loop
+    over the atomic structure (cell and/or atomic positions), in which stresses
+    and/or forces are computed and used to find the next structure. PWscf is 
+    organized in a different way: a do loop in which an electronic scf step 
+    ("electrons") is followed by force and stress calculation and by an ionic 
+    step ("move_ions") that computes the new structure (this was done in order
+    to accommodate the Car-Parrinello case, no longer implemented in PWscf,
+    while the CP code has a completely different, and messier, structure).
+    Subroutine move_ions is a mixture of different codes, written by different
+    people in different times, following different logics, writing different
+    files, implementing different but partially overlapping functionalities
+    that are almost orthogonal to those of CP. 
+    It is not obvious to figure out what the code is doing and what are the 
+    variables of the current step and what those of the previous or next step,
+    especially for variable-cell calculations. A few long-ranged consequences
+    of this situation:
+    - 'move_ions' restarts at each time step, reading and writing a restart
+      file (or more than one). Restart in 'electrons' follows a different
+      logic (sec.6.2 of the developer manual): files are written when the
+      code is cleanly stopped, with each loop saving its own internal state.
+    - Wavefunction and charge density interpolation, used in MD, follows an
+      internal (il-)logic that produces a disproportionate amount of I/O
+      (files are closed and opened at each step)
+
+    Actions:
+    - In extrapolation, the needed files should be kept in memory as "buffers",
+      not closed; saved only in case of a clean stop, read if restarting.
+      Alternative: rename files instead of reading and rewriting them
+      (not sure this can be done with open files, though)
+    - Restructure move_ions: a complete rewriting is long and tedious, but we
+      should recast the various pieces into a common structure, unifying step
+      index, current and next cell/atoms, and a single restart file (output
+      files as well, that must be documented) with the same logic as for
+      electrons.
+    - Merge thermostats, starting conditions, etc., with CP
+    - We should keep track of the starting cell in variable-cell calculations
+      (this is something that CP does: see variable "cell_ref")
+
+1.3 Final data I/O
+
+    Description of the problem:
+    While most I/O problems have disappeared with the old format, there are
+    still a few things to be done and a few sources of trouble to be removed:
+    - Obsolete variable wf_collect is still there
+    - We cannot remove iotk because it is still used here and there
+    - PWscf uses the same directory for reading and writing. There should be
+      a clear distinction between the two, like in CP (which however uses an
+      obsolete style with "ndr" and "ndw" variables).
+      By the way: machine-dependent quantities like "outdir" should not be
+      read as input variables but only via environment variables.
+    - The schema is not sufficient as documentation: we need to know what
+      exactly is written to file, and in which units
+    - The new XML input is written to data file but cannot be read directly
+      by the code (should it be? to be decided)
+    - The current algorithm for portable I/O of binary data requires the
+      allocation of a large, nondistributed array of indices for global
+      sorting (on all G-vectors). This may become a memory bottleneck.
+      See also the "shell ordering" problem in 2.4.
+    - It would be useful to write warning and error messages in the XML
+      output data file
+    - The routine "read_file_new", in spite of its being "new", uses the
+      same "old" style of reading wavefunctions, rewriting them to
+      direct-access files ("read_collected_to_evc" routine). This is wasteful
+      (see also the "scratch I/O" problem below, 1.4) and unnecessary for
+      most post-processing codes, that need to read the wavefunctions just
+      once. Moreover read_file_new does too many things, and even
+      "read_file_xml" does more than just reading the xml file.
+
+    Actions:
+    - Remove wf_collect, update documentation accordingly
+    - Replace iotk with FoX everywhere, or delete it. Most of the residual
+      usage of iotk is in the phonon code, for which we should proceed with
+      the new XML format
+    - It could be a good idea to write the xml data file into the hdf5 file
+    - Write (optionally) binary files in single precision: should be
+      sufficient for most purposes
+    - Introduce a distinction between "indir" and "outdir" (today there is
+      only the latter, both for input and for output); deprecate "outdir"
+      (and possibly other similar variables) as input variable
+    - Document what is written and in which units everywhere. Also:
+      provide sample code to extract data from data files.
+    - Consider reading input XML directly
+    - Start thinking about parallel HDF5
+    - Take wavefunction reading out of read_file_new, read single
+      wavefunctions directly from the data directory when needed
+      (storing them into buffer if needed)
+
+1.4 Scratch I/O during execution
+
+    Description of the problem:
+    PWscf still uses the old paradigm of "keep one k-point in memory, store
+    all others to file", with the "buffer" trick allowing transparent storing
+    in memory and not on disk. It is questionable whether the old paradigm is
+    still valid on modern machines: typically, the RAM per single processor
+    should be amply sufficient for all jobs that can be reasonably run on a
+    single processor.
+    While the "buffer trick" allows to avoid most of the read/write in PWscf,
+    it is not present in all other codes having k-point capabilities (e.g.
+    PHonon), that make a vast amount of I/O.
+
+    Actions:
+    - Remove I/O of rho mixing information: it is useful to have exactly
+      the same behavior when restarting, but not for much more than that.
+    - Remove the "buffer" machinery, add a k-point index to wavefunctions.
+      This is a major change that will affect most of QE codes, though.
+      Alternatively: keep the buffer machinery, extend it to PHonon and
+      similar codes
+
+1.5 Plugins
+
+    Description of the problem:
+    Many additions and extensions to PWscf have found their way into the
+    released code. It is however not always desirable to have all possible
+    extensions built-in into the code, especially for little-used, highly
+    specialistic options: it makes the code harder to read and to work
+    with, its input a big mess of variables and options.
+    It would be desirable to have a way to add "on demand" some features
+    (ideally at run time like Linux kernel modules, but this is obviously
+    beyond what is realistic) to the code, by patching the code at some
+    specific places, or returning the needed quantites via some "hook"
+    routines in the main code. There is currently a "plugin" machinery,
+    implemented for the following cases:
+    - Environ
+    - Plumed (old version)
+    - pw2casino
+    The latter case does not actually imply any patching of the code.
+    So only Plumed and Environ are actually there
+
+    Actions:
+    - make a list of existing and forthcoming options that should be better
+      moved into a plugin. Good candidates may include:
+      * QMMM
+      * Plumed (new version)
+      * external electric fields (sawtooth)
+      * external potentials
+      * constraints, external forces
+      * RISM-3D (currently in a branch)
+      * ESM
+    - Examine whether the current plugin machinery is what we need, and if
+      so, extend it to more cases; if not, think something different; if
+      not at all, let's drop it.
+    - Document what has to be done in order to add a plugin
+
+1.6 XC functionals
+
+    Description of the problem:
+    The existing machinery for XC functionals is rich but confusing.
+    It is a good candidate to become a "domain-specific" library with a
+    relatively minor effort, with some cleanup and optimization in the
+    meantime.
+
+    Actions:
+    - Since there is already another library, libxc, used in many other
+      codes, it is convenient to make a common interface between libxc
+      and our functionals, at least for the main functionalities.
+      Something along these lines is already in place (look for for __LIBXC
+      in the code). We might even consider giving up our functionals
+      in favor of libxc, but it seems to me a dumb move.
+    - Turn our functionals into a library. This may also be an opportunity
+      to make the code easier to use and to parallelize. For instance, the
+      choice of which functional to use should be done outside the loop over
+      grid points, not inside as it is now. Also: we should be more careful
+      with the rho->0, grho->0 limit.
+    - Unify calls to meta-GGA and GGA (no meta) functionals, that are currently
+      done by two different but strongly overlapping routines
+
+1.7 Reorganization of charge density in the LSDA case
+
+    Description of the problem:
+    Currently the charge density in the LSDA case is organized as
+    rho(:,1)=rho up, rho(:,2)=rho down, while in the noncolinear case
+    it is  rho(:,1)=rho tot, rho(:,2:4)=magnetization.
+
+    Actions:
+    - Convert the charge density in the LSDA case to rho(:,1)=rho tot,
+      rho(:,2) = magnetization. This would make the LSDA case more similar
+      to the unpolarized and nonoclinear cases. It may also reduce the
+      need for the current bunch of nspin_this and nspin_that variables.
+      (READY)
+
+1.8 Reorganization of CP
+
+    Description of the problem:
+    The structure of CP is seriously different from the one of PWscf (see 1.2)
+    and the dynamics of CP is almost orthogonal to the one of PWscf (the only
+    common calculation being plain Verlet). Unfortunately there are differences
+    also at a deeper level, in the way the cell and atomic positions are stored
+    (even units are different).
+
+    Actions:
+    - split plain-vanilla CP from the rest, leaving the Wannier-function
+      version of CP as a separated one (reason: together with the conjugate
+      gradient stuff, it is the messier part of CP).
+    - Unify units in CP and PW. It is obviously much faster to adopt PW units
+      in CP than the opposite.
+    - Unify cell and atomic positions in CP and PW (beware crystal coordinates
+      vs a0 units, ordering of atoms, trasposition of matrices, etc.)
+    - Recast the structure of CP code into one more similar to that of PWscf.
+      This requires either a major refactoring or many small steps pointing
+      in the same direction. It is a major effort anyway.
+    - Merge thermostats and constraints in CP and PWscf
+    - In the long run, it might be conceivable to merge, at least for the
+      Gamma-point case, the electronic minimization of CP with self
+      consistency of PW and use a single global minimization
+
+1.9 QE as a library
+
+    Description of the problem:
+    There are many cases in which the DFT part of PWscf (or of CP) is used 
+    as quantum engine by other codes (fortran codes in QE itself, or in other
+    languages and external to QE):
+    - structural optimization
+    - molecular dynamics
+    - NEB
+    - basin hopping (private implementation exists)
+    - genetic algorithms (there are some implementations around)
+    - "steering" with ASE or other python-based frameworks
+    - ...
+    While the actual implementation is in theory appropriate, there are
+    invariably some minor or subtle differences that spoil the nice picture.
+  
+    Actions:
+    - Figure out which routines performing specific tasks (initialization, scf,
+      forces, etc.) are used in the way described above and what do they need.
+      Problems typically arise from I/O more often than from computation
+      (see previous observations on "outdir" variables).
+      It might be needed to move I/O-related input data from input file to
+      command line or environment variable, or convert to fixed-name files.
+    - At a fine-grained level, we should make it more explicit which routines
+      (in particular, initialization routines) depend upon
+      * lattice vectors
+      * atomic positions
+      * k-points
+      * ...
+      in order to know what to call in case some of the above variables change. 
+      We should also make more explicit which variables are needed and which
+      routines must be called before executing specific and relevant parts 
+      of the code (in particular, H\psi)
+
+1.10 Libraries from QE
+
+    Description of the problem:
+    One of the promises of MaX is to extract "domain-specific libraries"
+    (DSL) from the various MaX codes. This has the beneficial side effect
+    of forcing a major cleanup, refactoring, and documentation of the
+    interested pieces of code, so it may be interesting to do that
+    irrespective of MaX requirements. Some of the work was already done
+    during MaX-1 (LAXlib, FFTXlib, KS_Solvers) or started (LRlibrary)
+
+    Actions:
+    - Make a list of candidate libraries. In addition to the already
+      mentioned XC library and to the continuation of work on LRlibrary,
+      potential candidate include:
+      * symmetry and k-points tools and utilities
+      * charge density mixing
+      * pseudopotential reading/conversion/writing utilities
+      * utilities for XML/binary data/HDF5 I/O
+      * ...
+    - Examine what has to be done in practice (typically, more than what one
+      expects before starting to work) and whether it is worth the effort
+    - Consider the implications of disassembling a large code into smaller,
+      semi-independent pieces (not all consequences are positive, quite the
+      opposite), in particular wrt versioning, maintainability and building
+    - Restart work on LRlibrary. This is likely the most important but also
+      the most challenging of all DSL
+
+2.  QE Features
+
+2.1 Dealing with "not implemented" and "half-baked" features
+ 
+    Description of the problem:
+    There are many calculations that are not implemented in some cases.
+    Most such cases are flagged as errors, but some (especially in the phonon
+    code) are not, potentially leading to wrong results. A few cases:
+    - noncollinear stress for GGA and hybrid functionals
+    - band structure for hybrid functionals 
+    - almost everything with meta-GGA, which in addition has serious
+      convergence issues (see 1.3) and no PP generation code available in QE
+    - TS-VdW with USPP/PAW
+    - orbital magnetization with LSDA 
+    - Forces for generalized DFT+U
+    - DFT+U with more than a single U per atom
+    - Plugin for PLUMED v.3
+    There are also several implemented features that are seldom (or never)
+    used because little know, documented and studied. Tentative list:
+    - USPP and PAW for hybrid functionals: both are extraordinarily slow,
+      the latter does not seem to work properly 
+    - Fourier filtering of beta(r) and q(r) functions (see 3.2)
+    - QMMM with MPI communicators: not clear whether it works or not
+
+    Actions:
+    - Implement/complete/document/make robust those cases that appear
+      to be useful
+    - Disable and forget those cases that are too difficult to implement
+      or that do not seem to work well or to be of interest to anybody
+
+2.2 Hybrid functionals
+
+    Description of the problem:
+    After the implementation of ACE plus parallelization over pairs of bands
+    (PPB) and of SCDM localization, the code computing hybrid functionals
+    is much faster but also in a rather confusing state.
+    Most of the problems come from PPB, that seems to be more complex and to
+    use more memory than needed, and whose inner behavior nobody knows
+    (except maybe Ye Luo). Also, PPB and SCDM are not compatible, since the
+    latter decides at run time which pairs of bands enter the sum, with no
+    possibility to balance across processors. Also: SCDM requires bands in
+    real-space buffer exxbuff to be stored as real vectors, not as pairs in
+    a complex vector (current choice for Gamma; k-SCDM status is unclear)
+    Actions:
+    - Decide a strategy:
+      * merge everything? keep PPB separated from ACE+SCDM (at Gamma),
+        from ACE (at k)? other possibilities?
+      * what should we do with the non-ACE case? if deleted, it should be
+        possible, at least at Gamma, to speed up a bit and to save memory
+    - If we keep the PPB, we should simplify it and make it consistent with
+      band parallelization in the rest of the code (I am not sure it is now)
+
+2.3 Meta-GGA functionals
+
+    Description of the problem:
+    Meta-GGA functionals are implemented in QE (both in PW and in CP)
+    but they are numerically very unstable. SCAN is numerically stable
+    but very "noisy" unless a very dense FFT grid is used to compuet
+    the V\nabla\psi term. There is no PP generation code for metaGGA.
+    Actions:
+    - Port into QE the old meta-GGA code (still available and still working)
+    - figure out the origin of numerical instabilities of the current
+      implementation, if possible, or a way to deal with the V\nabla\psi 
+      term without increasing the FFT grid everywhere: is it convenient
+      to introduce a custom grid on the fly?
+
+2.4 Miscellaneous improvements
+
+    - Add possibility to compute k-point grids of prescribed density
+    - PHonon: better mixing algorithm, with better convergence criterion
+      (the current criterion looks weird if not incorrect to me)
+    - Supercells given via cell + matrix
+    - Variable-cell calculations: get rid of the infamous error message
+      "not enough space allocated for fft". May need some re-organization
+      of initialization (made less frequent by increasing cell_factor)
+    - The ordering inside shells of G-vectors (and also of k+G vectors in
+      presence of k-points) is unpredictable. The same code on the same
+      machine finds the same order, but even minimal differences have the
+      potential to yield a different ordering. We should never rely on the
+      assumption that we are going to find the same ordering as in a previous
+      run: indices should be always read from file, not recomputed (but
+      parallel FFT must not be broken). One should also be very careful
+      in assuming that the k+G list at k=0 is the same with and without
+      the "igk_k" ordering.
+
+3.  Performances (algorithmic improvements)
+
+3.1 Extend Gamma-point trick
+
+    Description of the problem:
+    For functions of G (not of k+G) that are real in real space (rho, V,
+    augmentation charges) we can always use only half G-vectors and
+    perform two FFT's at the same time. This is always done in CP,
+    but not in PW (only when k=0 are "Gamma tricks" applied)
+
+    Actions:
+    - change the distribution of G-vectors so that the "gamma trick" is
+      always applicable. In order to ensure compatibility with existing
+      code, and with cases where the trick cannot be applied (e.g. phonon
+      at finite q), one might do the following: keep a separate variable
+      (e.g. ngm0, ngms0) for the half sphere, allocate and fill indices
+      nl, nls up to the complete sphere. The code can thus be changed
+      one piece at the time. 
+      ALTERNATIVE (SdG): implement real FFT, by performing the gamma trick
+      inside the FFT, removing almost entirely gamma tricks from the code
+
+3.2 Augmentation charges and pseudopotential projectors in real space
+
+    Description of the problem:
+    Augmentation charges and scalar products <\psi_i|\beta_j> can be
+    quickly computed in real space, by exploiting locality of beta's
+    and Q's. A partial implementation exists, works reasonably well
+    for augmentation charges (tqr option), less so for betas (real_space
+    option). The problem is that real-space beta's and Q that are
+    equivalent to their G-space counterparts at finite cutoff are not
+    strictly localized in space, unlike functions at infinite cutoff.
+    A "Fourier filtering" has been implemented by SdG, but it is
+    insufficiently tested.
+
+    Actions:
+    - extensively test Fourier filtering, especially for beta's
+
+3.3 "Adaptive" calculations
+
+    Description of the problem:
+    It would be very convenient to start long calculations (e.g. structural
+    optimizations) with a low cutoff, refine with the final cutoff.
+    The same applies to the k-point grid: one could start with a minimal grid,
+    refine with the final one.
+    Currently, none of the above is possible without restarting from scratch.
+
+    Actions:
+    - Study how to read rho(G) computed for a small grid of G, and bring it
+      to a larger G grid (maybe it is already possible)
+    - Same for \psi_i(G) (less obvious)
+    - Project \psi_k on a local basis set, obtain the tight-binding
+      Hamiltonian, interpolate for the required k-point grid.
+      This would be useful in general, also to speed up the calculation
+      of the band structure.
+
+4.  Performances (parallelization)
+
+4.1 Better strong scaling (i.e. at fixed problem size)
+
+    Description of the problem:
+    In spite of the many available parallelization levels, PWscf does not
+    scale well beyond a relatively small number of processors, especially
+    for USPP and PAW where the lower cutoff makes the H\psi term less
+    dominant (or even not dominant at all). The content of this page:
+    https://www.nsc.liu.se/~pla/blog/2013/02/19/qevasp-part2/
+    is unfortunately still true, at least in its main lines.
+    The main bottlenecks limiting strong scaling are, in decreasing order
+    of importance:
+    - subspace (conventional) diagonalization in Davidson. ScaLAPACK and ELPA
+      do not scale beyond N^2 processors when the number or rows or columns
+      divided by N is smaller than a few hundreds (and they never scale well). 
+      In CP this is also true but CP makes a smaller usage of conventional 
+      diagonalization
+    - Calculation of charge density and potentials. These calculations (which
+      are replicated on different pools in case of k-point parallelization) 
+      may take a sizable amount of time, even after the recent speedup of the
+      USPP and PAW parts. The 'local-TF' mixing mode is also expensive.
+    - FFT's on rho and V, not scaling when than number of MPI processes
+      exceeds the third FFT dimension. Task groups help for FFT's in H\psi
+      but not for FFT's on charge density and potentials. The new FFT by
+      SdG should however have changed this.
+    
+    Actions:
+    - Check whether Davidson with minimal subspace (diago_david_ndim=2) works
+      better than the default diago_david_ndim=4 (I suspect that it is
+      convenient in many more cases than not)
+    - Study how well new iterative diagonalizations with reduced[1] subspace
+      diagonalization perform, in particular: PPCG (in KS_solvers/),
+      RM-DIIS (in Nisihara's fork). Some references:
+      * PPCG (http://arxiv.org/pdf/1407.7506.pdf) is available in KS_Solvers
+              for diagonalizazion without overlap matrix)
+      * ParO: arxiv.org/pdf/1405.0260.pdf, http://arxiv.org/pdf/1510.07230.pdf
+      * LOPBCG (A. Knyazev, SIAM J. Sci.Comput. 23 (2) (2001) 517–541;
+                https://en.wikipedia.org/wiki/LOBPCG )
+      [1] ideally absent, in practice must be done for numerical stability,
+          but even reducing subspace diagonalization to one every 4-5 H\psi,
+          on matrices NbxNb, Nb=number of states, would be a big improvement
+      Even if none of these proves able to replace Davidson, a replacement
+      of poorly-scaling but memory-sparing CG diagonalization would already
+      be useful
+    - There is some confusion with the various kinds of band parallelization
+      what works well, what not so well, what not at all (see also 2.2)
+      Examine the performances of parallelization over bands (preferrably,
+      distributed bands), in addition to (or in replacement of) task groups.
+      If unsatisfactory, we should decide what to do. Band parallelization
+      might allow to remove the current code in calbec computing
+      |\beta_l><\beta_m|\psi_j> without storing all <\beta_m|\psi_j>,
+      that has never been really used because slow.
+    - Rethink k-point parallelization ("pools"): operations on rho and V
+      should be ideally distributed over all pools, not replicated on each
+      pool. This requires a way to pass from a FFT grid distributed on N
+      processors to grids distributed over N/Nk processors. There are at
+      least two more cases like this in the code: task groups, exact exchange.
+      If not possible, operations should be performed on a single pool and
+      broadcast to all others, to prevent misalignment between processors.
+    - Extend OpenMP parallelization, still not present or not effective
+      in many parts of the code
+    - Add "spot" parallelization levels for parts of the code not currently
+      parallelized, even if they take little time: everything becomes a
+      bottleneck sooner or later.
+
+4.2 Automatic estimate of parallelization parameters
+
+    Description of the problem:
+    Most inexperienced users use PWscf (and likely also CP) with grossly
+    inadequate parallelization parameters, by setting a large number of
+    processors and expecting the code to cope with it. Even experienced 
+    users would appreciate a quick way to estimate the best parallelization 
+    options, or an automatic even if sometimes suboptimal estimate.
+
+    Actions:
+    - Decide and implement heuristic criteria. For instance, given a
+      total number N of processes:
+      * always use k-point parallelization if possible (Nk pools)
+      * if Nfft=N/Nk > Nr3 use Nt task groups so that Nfft=N/Nk/Nt > Nr3/2
+      * if still too many processes, use 4-8 OpenMP tasks
+      * use Nd*Nd <= Nfft processors for linear algebra so that Nbands/Nd
+        is in the order of some reasonable number (250? 500?)
+      Test the criteria in some cases, improve if needed
+    - Decide and implement criteria for analysing the results, such as:
+      * too large Wall-CPU time difference (not explained by OpenMP) =>
+        something is not right
+      * too much time spent in FFT scatter => reduce number of procs for FFTs
+      * too much time spent in subspace diagonalization => change number of
+        processors for linear algebra, use k-point parallelization
+      * ...
+    - Consider probing optimal parallelization, by performing selected
+      tests of relevant operations for different number of processors
+
+5.  Performances (stability and robustness)
+
+5.1 Iterative diagonalization problems
+
+    Description of the problem:
+    Quite often, the Davidson diagonalization crashes because the overlap	
+    matrix is not positive definite amd the Choleski decomposition fails.
+    It would be useful to circumvent this problem, that is not always a
+    fatal one but often a transient one that disappears at convergence.
+
+    Actions:
+    - discard too small correction vectors, replace them with random numbers
+      (or with other correction vectors)
+    - use a fixed-size correction vector packet, same size as trial vectors
+      (too small correction vectors must be discarded, otherwise it is not
+      stable). This would also simplify a lot the algorithm.
+    - exit after a small (fixed) number of iterations, or when the error
+      (size of correction vectors) is reduced by a fixed amount
+    - if Choleski fails: diagonalize S, compute S^{-1/2} discarding negative
+       or too small eigenvalues, solve S^{-1/2}HS^{-1/2}\phi = \epsilon\phi
+
+5.2 Bad SCF convergence
+
+    Description of the problem:
+    The convergence of the SCF procedure is often lousy, sometimes impossible.
+
+    Actions:
+    - Figure out when and why, or at least when: it seems to me that
+      spin-polarized cases, DFT+U are the most frequent offenders
+    - Restart mixing with reduced beta in case of insufficient progress
+    - Stop with a more informative message on what to do in case of no progress
+    - It would be conceivable to introduce some form of global minimization,
+      at least at Gamma, instead of self-consistency
+
+6.  Porting to new architectures
+
+6.1 GPUs
+
+6.2 QE for Windows
+
+    QE on Windows basically works. For obscure reasons, however, windows
+    executables are unable to open the scratch directory, apparently
+    depending upon something in the configuration of the Windows machine
+
+7.  Building, Testing, Documentation
+
+7.1 Build mechanism and configure 
+
+    Description of the problem:
+    Even after some recent cleanup, the current "configure" machinery still
+    contains a lot of clumsy and obsolete stuff; the documentation is poor;
+    parallel make breaks all the time. The same applies to files in install,
+    notably plugins_list and plugins_makefile, and to the Makefiles.
+
+    Action:
+    - remove obsolete stuff, update and extend documentation
+    - simplify configure: search only for MPIF90, derive F90 from MPIF90
+      (DONE). Is the search for F77 really useful any longer?
+    - make compilation with OpenMP the default?
+    - is configure working for libxc / hdf5 / other optional libraries?
+      to be verified
+    - verify whether in the various Makefiles's, dependencies of targets upon
+      $(OBJS), $(LIBS) and the like are needed or useful: I suspect they aren't
+
+7.2 Tests and examples
+
+    Description of the problem:
+    Existing "examples" cover a large range of cases, but they are
+    - unsuitable for automated check of the correctness of the results
+    - written as complex scripts, obscure and confusing for most people
+    - often slow to execute.
+    The test-suite is good for automated testing but works only for
+    a few codes and it is also not exhaustive
+    
+    Actions:
+    - Extend automated testing to missing cases and other QE modules.
+      The extension to postprocessing is especially problematic, due
+      to the limited availability of easily testable quantities.
+    - Replace current examples with simpler, more readable scripts
+
+7.3 Source code documentation
+
+    Description of the problem:
+    Some time ago it was suggested to add a standard header to all
+    codes and to use Ford for automatic documentation. This hasn't
+    moved much beyond the first two routines, PW/src/pwscf.f90 and
+    PW/src/run_pwscf.f90, though.
+
+    Actions:
+    - write some "meta-documentation" on how to write documentation
+    - verify whether Ford is the good tool or not.
+      If so, we need directions on how to make the best usage of it,
+      also in relation with developer documentation (see below)
+      If not, we need to search for something else.
+
+7.4 Developer documentation
+
+    Description of the problem:
+    nonexistent (the documentation, not the problem). More exactly:
+    there is a "developer manual", containing a general introduction
+    on QE from the point of view of development, but very little on the
+    code itself and on how to use and call QE routines. Moreover the
+    format of the developer manual (LaTeX) is excellent for formulas
+    (that are not present) but clumsy otherwise. The missing information
+    on the code and its usage is sometimes available in the source code or
+    somewhere in cyberspace (e.g. mailing lists) but not easily accessible.
+
+    Actions:
+    - decide on a new format (.md?) for the developer manual
+    - collect in the developer manual or in some other suitable place
+      the available code documentation (also using Ford output?);
+      start adding what is missing
+
+7.5 User documentation
+
+    Description of the problem:
+    User documentation is scattered between the user manual (written in LaTeX,
+    see above), input data helpdoc files, README's in examples, archives of
+    the users mailing list, web site, ...
+
+    Actions:
+    - As for developer documentation: collect available info in the same
+      place, start adding what is missing
